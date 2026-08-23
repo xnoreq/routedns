@@ -307,10 +307,10 @@ func (q *inFlightQueue) delete(r *request) {
 func (q *inFlightQueue) drain(err error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for id, r := range q.requests {
+	for _, r := range q.requests {
 		r.markDone(nil, err)
-		delete(q.requests, id)
 	}
+	clear(q.requests)
 }
 
 func (q *inFlightQueue) maxQueueLen() int64 {
