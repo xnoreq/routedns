@@ -44,6 +44,7 @@ func NewPipeline(id string, addr string, client DNSDialer, timeout time.Duration
 		addr:     addr,
 		client:   client,
 		requests: make(chan *request),
+		inFlight: newInFlightQueue(),
 		metrics:  NewListenerMetrics("client", id),
 		timeout:  timeout,
 	}
@@ -242,6 +243,12 @@ type inFlightQueue struct {
 	maxLen   int
 }
 
+func newInFlightQueue() inFlightQueue {
+	return inFlightQueue{
+		requests: make(map[uint16]*request),
+	}
+}
+
 // Add a request to the queue and return an updated DNS query with a new ID. The ID needs
 // to be unique per connection, and we could be receiving multiple queries with the same
 // ID. So pick a random ID that isn't currently in flight, use that in the query upstream,
@@ -249,9 +256,6 @@ type inFlightQueue struct {
 func (q *inFlightQueue) add(r *request) *dns.Msg {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if q.requests == nil {
-		q.requests = make(map[uint16]*request)
-	}
 	if len(q.requests) >= math.MaxUint16 {
 		return nil
 	}
