@@ -259,12 +259,15 @@ func (q *inFlightQueue) add(r *request) *dns.Msg {
 	if len(q.requests) >= math.MaxUint16 {
 		return nil
 	}
-	var id uint16
+	id := dns.Id()
 	for {
-		id = dns.Id()
+		if id == 0 { // avoid default uint16 value
+			id++
+		}
 		if _, inUse := q.requests[id]; !inUse {
 			break
 		}
+		id++
 	}
 	r.id = id
 	q.requests[id] = r
