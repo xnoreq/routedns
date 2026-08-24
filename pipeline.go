@@ -28,6 +28,7 @@ type Pipeline struct {
 	inFlight inFlightQueue
 	metrics  *ListenerMetrics
 	timeout  time.Duration
+	reqsSema chan struct{}
 }
 
 // DNSDialer is an abstraction for a dns.Client that returns a *dns.Conn.
@@ -47,6 +48,7 @@ func NewPipeline(id string, addr string, client DNSDialer, timeout time.Duration
 		inFlight: newInFlightQueue(),
 		metrics:  NewListenerMetrics("client", id),
 		timeout:  timeout,
+		reqsSema: make(chan struct{}, math.MaxUint16-1), // limits concurrent requests
 	}
 	go c.start()
 	return c
@@ -54,12 +56,22 @@ func NewPipeline(id string, addr string, client DNSDialer, timeout time.Duration
 
 // Resolve a single query using this connection.
 func (p *Pipeline) Resolve(q *dns.Msg) (*dns.Msg, error) {
-	r := newRequest(q)
-
 	timeout := time.NewTimer(p.timeout)
 	defer timeout.Stop()
 
+	// Acquire semaphore token or timeout waiting for a free slot
+	select {
+	case p.reqsSema <- struct{}{}:
+	case <-timeout.C:
+		p.metrics.err.Add("querytimeout", 1)
+		return nil, QueryTimeoutError{q}
+	}
+
+	// Ensure token is released when Resolve exits
+	defer func() { <-p.reqsSema }()
+
 	// Queue up the request or time out
+	r := newRequest(q)
 	select {
 	case p.requests <- r:
 	case <-timeout.C:
@@ -70,13 +82,12 @@ func (p *Pipeline) Resolve(q *dns.Msg) (*dns.Msg, error) {
 	// Wait for the request to complete or time out
 	select {
 	case <-r.done:
+		return r.a, r.err
 	case <-timeout.C:
 		p.inFlight.delete(r)
 		p.metrics.err.Add("querytimeout", 1)
 		return nil, QueryTimeoutError{q}
 	}
-
-	return r.waitFor()
 }
 
 // Starts a loop that will wait for queries and open an upstream connection on-demand, writing queries
@@ -85,56 +96,100 @@ func (p *Pipeline) Resolve(q *dns.Msg) (*dns.Msg, error) {
 func (p *Pipeline) start() {
 	var wg sync.WaitGroup
 	log := Log.With("addr", p.addr)
-	for req := range p.requests { // Lazy connection. Only open a real connection if there's a request
+
+	var pendingReq *request
+	for {
+		// Acquire a request: reuse a pending retry request or wait for a new one from p.requests
+		var ok bool
+		if pendingReq == nil {
+			pendingReq, ok = <-p.requests
+			if !ok {
+				break
+			}
+		}
+
+		req := pendingReq
+		pendingReq = nil
+
 		done := make(chan struct{})
+		// Lazy connection. Only open a real connection if there's a request
 		log.Debug("opening connection")
 		conn, err := p.client.Dial(p.addr)
 		if err != nil {
 			p.metrics.err.Add("open", 1)
 			log.Warn("failed to open connection", "error", err)
 			req.markDone(nil, err)
+
+			// drain and fail queued requests
+		DrainLoop:
+			for {
+				select {
+				case req, ok = <-p.requests:
+					if !ok {
+						break DrainLoop
+					}
+					req.markDone(nil, err)
+				default:
+					break DrainLoop
+				}
+			}
 			continue
 		}
+
 		wg.Add(2)
 
-		go func(r *request) { p.requests <- r }(req) // re-queue the request that triggered the upstream connection
-
 		go func() { // writer
+			defer wg.Done()
+			defer conn.Close() // should wake up the reader as well
+
+			w := func(req *request, isFresh bool) bool {
+				query := p.inFlight.add(req)
+				log.With("qname", qName(query)).Debug("sending query")
+				p.metrics.query.Add(1)
+				if err := conn.WriteMsg(query); err != nil {
+					// Take the request back out of the in-flight queue before
+					// completing it. The reader matches responses by ID and
+					// completes whatever request it finds there; completing a
+					// request twice would panic on the double close of its
+					// done channel. Whoever removes it from the queue owns it.
+					if p.inFlight.get(query) != nil {
+						if isFresh {
+							req.markDone(nil, err) // fail the request
+						} else {
+							// Failed on a reused connection (e.g., idle connection closed by upstream);
+							// hand back for retry on a fresh connection
+							pendingReq = req
+						}
+					}
+					p.metrics.err.Add("send_query", 1)
+					log.With("qname", qName(query)).Debug("failed sending query",
+						"error", err)
+					return false
+				}
+
+				return true
+			}
+
+			if ok := w(req, true); !ok { // initial request
+				return
+			}
+
 			for {
 				select {
 				case req := <-p.requests:
-					query := p.inFlight.add(req)
-					if query == nil {
-						req.markDone(nil, errors.New("too many queries in flight"))
-						p.metrics.err.Add("inflight_full", 1)
-						continue
-					}
-					log.With("qname", qName(query)).Debug("sending query")
-					p.metrics.query.Add(1)
-					if err := conn.WriteMsg(query); err != nil {
-						// Take the request back out of the in-flight queue before
-						// completing it. The reader matches responses by ID and
-						// completes whatever request it finds there; completing a
-						// request twice would panic on the double close of its
-						// done channel. Whoever removes it from the queue owns it.
-						if p.inFlight.get(query) != nil {
-							req.markDone(nil, err) // fail the request
-						}
-						conn.Close() // throw away this connection, should wake up the reader as well
-						wg.Done()
-						p.metrics.err.Add("send_query", 1)
-						log.With("qname", qName(query)).Debug("failed sending query",
-							"error", err)
+					if ok = w(req, false); !ok {
 						return
 					}
 				case <-done: // the reader ran into an error and we want to stop using this connection
-					conn.Close()
-					wg.Done()
 					return
 				}
 			}
 		}()
+
 		go func() { // reader
+			defer wg.Done()
+			defer close(done) // tell the writer to not use this connection anymore
+
 			for {
 				// Set the idle deadline on the reader, not the writer since when using UDP "connections",
 				// a network topology change wouldn't be noticed. Putting the idle timeout here ensures
@@ -151,15 +206,11 @@ func (p *Pipeline) start() {
 							p.metrics.err.Add("server_term", 1)
 							log.Debug("connection terminated by server")
 						}
-						close(done) // tell the writer to not use this connection anymore
-						wg.Done()
 						return
 					default:
 						if err == io.EOF {
 							p.metrics.err.Add("server_eof", 1)
 							log.Debug("connection terminated by server")
-							close(done) // tell the writer to not use this connection anymore
-							wg.Done()
 							return
 						}
 						// It's possible the response can't be correctly parsed, but we do have a response.
@@ -168,8 +219,6 @@ func (p *Pipeline) start() {
 						if a == nil {
 							p.metrics.err.Add("read", 1)
 							log.Warn("read failed", "error", err)
-							close(done) // tell the writer to not use this connection anymore
-							wg.Done()
 							return
 						}
 						log.Warn("failed to read response", "error", err, "qname", qName(a))
@@ -212,19 +261,6 @@ func newRequest(q *dns.Msg) *request {
 	}
 }
 
-// Wait for the request to be completed and return the answer.
-func (r *request) waitFor() (*dns.Msg, error) {
-	<-r.done
-
-	if r.err == nil {
-		if err := validateResponseQuestion(r.q, r.a); err != nil {
-			return nil, err
-		}
-	}
-
-	return r.a, r.err
-}
-
 // Mark the request as complete.
 func (r *request) markDone(a *dns.Msg, err error) {
 	if a != nil {
@@ -256,8 +292,8 @@ func newInFlightQueue() inFlightQueue {
 func (q *inFlightQueue) add(r *request) *dns.Msg {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if len(q.requests) >= math.MaxUint16 {
-		return nil
+	if len(q.requests) >= math.MaxUint16-1 {
+		panic("inFlightQueue len exceeding 2^16-1")
 	}
 	id := dns.Id()
 	for {
@@ -279,14 +315,17 @@ func (q *inFlightQueue) add(r *request) *dns.Msg {
 	return query
 }
 
-// Returns the request for a given query ID, or nil if the request isn't in the queue. The
-// request is removed from the queue.
+// Returns the request for a given query ID, or nil if the request isn't in the queue
+// or the answer was not valid. The returned request is removed from the queue.
 func (q *inFlightQueue) get(a *dns.Msg) *request {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	id := a.Id
 	r, ok := q.requests[id]
 	if !ok {
+		return nil
+	}
+	if err := validateResponseQuestion(r.q, a); err != nil {
 		return nil
 	}
 	delete(q.requests, id)
