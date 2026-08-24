@@ -53,17 +53,17 @@ func NewPipeline(id string, addr string, client DNSDialer, timeout time.Duration
 }
 
 // Resolve a single query using this connection.
-func (c *Pipeline) Resolve(q *dns.Msg) (*dns.Msg, error) {
+func (p *Pipeline) Resolve(q *dns.Msg) (*dns.Msg, error) {
 	r := newRequest(q)
 
-	timeout := time.NewTimer(c.timeout)
+	timeout := time.NewTimer(p.timeout)
 	defer timeout.Stop()
 
 	// Queue up the request or time out
 	select {
-	case c.requests <- r:
+	case p.requests <- r:
 	case <-timeout.C:
-		c.metrics.err.Add("querytimeout", 1)
+		p.metrics.err.Add("querytimeout", 1)
 		return nil, QueryTimeoutError{q}
 	}
 
@@ -71,8 +71,8 @@ func (c *Pipeline) Resolve(q *dns.Msg) (*dns.Msg, error) {
 	select {
 	case <-r.done:
 	case <-timeout.C:
-		c.inFlight.delete(r)
-		c.metrics.err.Add("querytimeout", 1)
+		p.inFlight.delete(r)
+		p.metrics.err.Add("querytimeout", 1)
 		return nil, QueryTimeoutError{q}
 	}
 
@@ -82,47 +82,47 @@ func (c *Pipeline) Resolve(q *dns.Msg) (*dns.Msg, error) {
 // Starts a loop that will wait for queries and open an upstream connection on-demand, writing queries
 // and reading answers concurrently using the same connection. It also handles errors like idle
 // close from upstream.
-func (c *Pipeline) start() {
+func (p *Pipeline) start() {
 	var wg sync.WaitGroup
-	log := Log.With("addr", c.addr)
-	for req := range c.requests { // Lazy connection. Only open a real connection if there's a request
+	log := Log.With("addr", p.addr)
+	for req := range p.requests { // Lazy connection. Only open a real connection if there's a request
 		done := make(chan struct{})
 		log.Debug("opening connection")
-		conn, err := c.client.Dial(c.addr)
+		conn, err := p.client.Dial(p.addr)
 		if err != nil {
-			c.metrics.err.Add("open", 1)
+			p.metrics.err.Add("open", 1)
 			log.Warn("failed to open connection", "error", err)
 			req.markDone(nil, err)
 			continue
 		}
 		wg.Add(2)
 
-		go func(r *request) { c.requests <- r }(req) // re-queue the request that triggered the upstream connection
+		go func(r *request) { p.requests <- r }(req) // re-queue the request that triggered the upstream connection
 
 		go func() { // writer
 			for {
 				select {
-				case req := <-c.requests:
-					query := c.inFlight.add(req)
+				case req := <-p.requests:
+					query := p.inFlight.add(req)
 					if query == nil {
 						req.markDone(nil, errors.New("too many queries in flight"))
-						c.metrics.err.Add("inflight_full", 1)
+						p.metrics.err.Add("inflight_full", 1)
 						continue
 					}
 					log.With("qname", qName(query)).Debug("sending query")
-					c.metrics.query.Add(1)
+					p.metrics.query.Add(1)
 					if err := conn.WriteMsg(query); err != nil {
 						// Take the request back out of the in-flight queue before
 						// completing it. The reader matches responses by ID and
 						// completes whatever request it finds there; completing a
 						// request twice would panic on the double close of its
 						// done channel. Whoever removes it from the queue owns it.
-						if c.inFlight.get(query) != nil {
+						if p.inFlight.get(query) != nil {
 							req.markDone(nil, err) // fail the request
 						}
 						conn.Close() // throw away this connection, should wake up the reader as well
 						wg.Done()
-						c.metrics.err.Add("send_query", 1)
+						p.metrics.err.Add("send_query", 1)
 						log.With("qname", qName(query)).Debug("failed sending query",
 							"error", err)
 						return
@@ -148,7 +148,7 @@ func (c *Pipeline) start() {
 						if e.Timeout() {
 							log.Debug("connection terminated by idle timeout")
 						} else {
-							c.metrics.err.Add("server_term", 1)
+							p.metrics.err.Add("server_term", 1)
 							log.Debug("connection terminated by server")
 						}
 						close(done) // tell the writer to not use this connection anymore
@@ -156,7 +156,7 @@ func (c *Pipeline) start() {
 						return
 					default:
 						if err == io.EOF {
-							c.metrics.err.Add("server_eof", 1)
+							p.metrics.err.Add("server_eof", 1)
 							log.Debug("connection terminated by server")
 							close(done) // tell the writer to not use this connection anymore
 							wg.Done()
@@ -166,7 +166,7 @@ func (c *Pipeline) start() {
 						// In this case, return it and carry on, don't terminate the connection because we
 						// got a bad packet (like a truncated one for example).
 						if a == nil {
-							c.metrics.err.Add("read", 1)
+							p.metrics.err.Add("read", 1)
 							log.Warn("read failed", "error", err)
 							close(done) // tell the writer to not use this connection anymore
 							wg.Done()
@@ -175,24 +175,24 @@ func (c *Pipeline) start() {
 						log.Warn("failed to read response", "error", err, "qname", qName(a))
 					}
 				}
-				req := c.inFlight.get(a) // match the answer to an in-flight query
+				req := p.inFlight.get(a) // match the answer to an in-flight query
 				if req == nil {
-					c.metrics.err.Add("unexpected_a", 1)
+					p.metrics.err.Add("unexpected_a", 1)
 					log.With("qname", qName(a)).Warn("unexpected answer received, ignoring")
 					continue
 				}
-				c.metrics.response.Add(rCode(a), 1)
+				p.metrics.response.Add(rCode(a), 1)
 				req.markDone(a, nil)
-				ql := c.inFlight.maxQueueLen()
-				if ql > c.metrics.maxQueueLen.Value() {
-					c.metrics.maxQueueLen.Set(ql)
+				ql := p.inFlight.maxQueueLen()
+				if ql > p.metrics.maxQueueLen.Value() {
+					p.metrics.maxQueueLen.Set(ql)
 				}
 			}
 		}()
 
 		// wait for both, sender and receiver to terminate before trying to reconnect
 		wg.Wait()
-		c.inFlight.drain(errors.New("upstream connection closed with request in flight"))
+		p.inFlight.drain(errors.New("upstream connection closed with request in flight"))
 	}
 }
 
