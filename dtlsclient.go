@@ -103,7 +103,7 @@ func NewDTLSClient(id, endpoint string, opt DTLSClientOptions) (*DTLSClient, err
 	return &DTLSClient{
 		id:       id,
 		endpoint: endpoint,
-		pipeline: NewPipeline(id, endpoint, client, opt.QueryTimeout),
+		pipeline: NewPipeline(id, endpoint, client, opt.QueryTimeout, false),
 		opt:      opt,
 	}, nil
 }

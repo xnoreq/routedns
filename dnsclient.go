@@ -65,11 +65,12 @@ func NewDNSClient(id, endpoint, network string, opt DNSClientOptions) (*DNSClien
 		NetNS:         opt.NetNS,
 		SocketOptions: opt.SocketOptions,
 	}
+	keepalive := strings.HasPrefix(network, "tcp")
 	return &DNSClient{
 		id:       id,
 		net:      network,
 		endpoint: endpoint,
-		pipeline: NewPipeline(id, endpoint, client, opt.QueryTimeout),
+		pipeline: NewPipeline(id, endpoint, client, opt.QueryTimeout, keepalive),
 		opt:      opt,
 	}, nil
 }

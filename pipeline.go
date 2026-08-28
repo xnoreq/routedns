@@ -22,13 +22,14 @@ const idleTimeout = 10 * time.Second
 // gracefully. It opens a single connection on demand and uses it for all queries.
 // It can manage UDP, TCP, DNS-over-TLS, and DNS-over-DTLS connections.
 type Pipeline struct {
-	addr     string
-	client   DNSDialer
-	requests chan *request
-	inFlight inFlightQueue
-	metrics  *ListenerMetrics
-	timeout  time.Duration
-	reqsSema chan struct{}
+	addr      string
+	client    DNSDialer
+	keepalive bool
+	requests  chan *request
+	inFlight  inFlightQueue
+	metrics   *ListenerMetrics
+	timeout   time.Duration
+	reqsSema  chan struct{}
 }
 
 // DNSDialer is an abstraction for a dns.Client that returns a *dns.Conn.
@@ -37,18 +38,19 @@ type DNSDialer interface {
 }
 
 // NewPipeline returns an initialized (and running) DNS connection manager.
-func NewPipeline(id string, addr string, client DNSDialer, timeout time.Duration) *Pipeline {
+func NewPipeline(id string, addr string, client DNSDialer, timeout time.Duration, keepalive bool) *Pipeline {
 	if timeout == 0 {
 		timeout = defaultQueryTimeout
 	}
 	c := &Pipeline{
-		addr:     addr,
-		client:   client,
-		requests: make(chan *request),
-		inFlight: newInFlightQueue(),
-		metrics:  NewListenerMetrics("client", id),
-		timeout:  timeout,
-		reqsSema: make(chan struct{}, math.MaxUint16-1), // limits concurrent requests
+		addr:      addr,
+		client:    client,
+		keepalive: keepalive,
+		requests:  make(chan *request),
+		inFlight:  newInFlightQueue(),
+		metrics:   NewListenerMetrics("client", id),
+		timeout:   timeout,
+		reqsSema:  make(chan struct{}, math.MaxUint16-1), // limits concurrent requests
 	}
 	go c.start()
 	return c
@@ -143,7 +145,11 @@ func (p *Pipeline) start() {
 			defer conn.Close() // should wake up the reader as well
 
 			w := func(req *request, isFresh bool) bool {
-				query := p.inFlight.add(req)
+				query := req.q.Copy()
+				if p.keepalive {
+					query = setKeepalive(query)
+				}
+				query = p.inFlight.add(req, query)
 				log.With("qname", qName(query)).Debug("sending query")
 				p.metrics.query.Add(1)
 				if err := conn.WriteMsg(query); err != nil {
@@ -190,12 +196,13 @@ func (p *Pipeline) start() {
 			defer wg.Done()
 			defer close(done) // tell the writer to not use this connection anymore
 
+			nextIdleTimeout := idleTimeout
 			for {
 				// Set the idle deadline on the reader, not the writer since when using UDP "connections",
 				// a network topology change wouldn't be noticed. Putting the idle timeout here ensures
 				// a reconnect in that case as well. This does create a very slight race however if the
 				// sender is using the connection right at the time of the timeout in the receiver.
-				_ = conn.SetReadDeadline(time.Now().Add(idleTimeout))
+				_ = conn.SetReadDeadline(time.Now().Add(nextIdleTimeout))
 				a, err := conn.ReadMsg()
 				if err != nil {
 					switch e := err.(type) {
@@ -232,9 +239,18 @@ func (p *Pipeline) start() {
 				}
 				p.metrics.response.Add(rCode(a), 1)
 				req.markDone(a, nil)
+
 				ql := p.inFlight.maxQueueLen()
 				if ql > p.metrics.maxQueueLen.Value() {
 					p.metrics.maxQueueLen.Set(ql)
+				}
+
+				if timeout, ok := popKeepalive(a, req.hadEdns0); ok {
+					if timeout == 0 { // Server requests immediate close
+						return
+					}
+
+					nextIdleTimeout = timeout
 				}
 			}
 		}()
@@ -245,19 +261,92 @@ func (p *Pipeline) start() {
 	}
 }
 
+func setKeepalive(query *dns.Msg) *dns.Msg {
+	opt := query.IsEdns0()
+	if opt == nil {
+		query.SetEdns0(4096, false)
+		opt = query.IsEdns0()
+	}
+
+	for _, o := range opt.Option {
+		if o.Option() == dns.EDNS0TCPKEEPALIVE {
+			return query
+		}
+	}
+
+	opt.Option = append(opt.Option, &dns.EDNS0_TCP_KEEPALIVE{
+		Code: dns.EDNS0TCPKEEPALIVE,
+	})
+
+	return query
+}
+
+func popEdns0(msg *dns.Msg) *dns.OPT {
+	for i := len(msg.Extra) - 1; i >= 0; i-- {
+		if msg.Extra[i].Header().Rrtype == dns.TypeOPT {
+			opt := msg.Extra[i].(*dns.OPT)
+			msg.Extra = append(msg.Extra[:i], msg.Extra[i+1:]...)
+			return opt
+		}
+	}
+	return nil
+}
+
+func popKeepalive(resp *dns.Msg, originalHadEdns0 bool) (time.Duration, bool) {
+	var (
+		result  = false
+		timeout = time.Duration(0)
+	)
+
+	opt := resp.IsEdns0()
+	if opt == nil {
+		return timeout, result
+	}
+
+	// Go through options, parse and remove keepalive
+	nOpt := 0
+	for _, o := range opt.Option {
+		if ka, ok := o.(*dns.EDNS0_TCP_KEEPALIVE); ok {
+			// Extract the values
+			if ka.Length != 2 {
+				result = true
+				timeout = 0
+			} else {
+				result = true
+				timeout = time.Duration(ka.Timeout) * 100 * time.Millisecond
+			}
+			// Do not increment nOpt (this drops the option)
+		} else {
+			// Keep other options
+			opt.Option[nOpt] = o
+			nOpt++
+		}
+	}
+	opt.Option = opt.Option[:nOpt]
+
+	// 3. Clean up the Extra section if we injected the EDNS0 record ourselves
+	if !originalHadEdns0 {
+		popEdns0(resp)
+	}
+
+	return 0, false
+}
+
 // Request received from a client. It also contains the response and a channel that is
 // closed when the request is done.
 type request struct {
-	q, a *dns.Msg
-	id   uint16
-	err  error
-	done chan struct{}
+	q, a     *dns.Msg
+	id       uint16
+	hadEdns0 bool
+	err      error
+	done     chan struct{}
 }
 
 func newRequest(q *dns.Msg) *request {
 	return &request{
-		q:    q,
-		done: make(chan struct{}),
+		q:        q,
+		hadEdns0: q.IsEdns0() != nil,
+		done:     make(chan struct{}),
 	}
 }
 
@@ -289,7 +378,7 @@ func newInFlightQueue() inFlightQueue {
 // to be unique per connection, and we could be receiving multiple queries with the same
 // ID. So pick a random ID that isn't currently in flight, use that in the query upstream,
 // then map it back to the request and replace the ID with the original one.
-func (q *inFlightQueue) add(r *request) *dns.Msg {
+func (q *inFlightQueue) add(r *request, query *dns.Msg) *dns.Msg {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if len(q.requests) >= math.MaxUint16-1 {
@@ -307,7 +396,7 @@ func (q *inFlightQueue) add(r *request) *dns.Msg {
 	}
 	r.id = id
 	q.requests[id] = r
-	query := r.q.Copy()
+
 	query.Id = id
 	if len(q.requests) > q.maxLen {
 		q.maxLen = len(q.requests)

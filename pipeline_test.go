@@ -22,7 +22,7 @@ func TestPipelineQueryTimeout(t *testing.T) {
 		time.Sleep(2 * time.Second)
 		return nil, errors.New("failed")
 	}
-	p := NewPipeline("test", "localhost:53", testDialer(df), time.Second)
+	p := NewPipeline("test", "localhost:53", testDialer(df), time.Second, false)
 
 	q := new(dns.Msg)
 	q.SetQuestion("example.com.", dns.TypeA)
@@ -56,7 +56,7 @@ func TestPipelineInFlightCleanup(t *testing.T) {
 	df := func(address string) (*dns.Conn, error) {
 		return &dns.Conn{Conn: client}, nil
 	}
-	p := NewPipeline("test", "localhost:53", testDialer(df), 50*time.Millisecond)
+	p := NewPipeline("test", "localhost:53", testDialer(df), 50*time.Millisecond, false)
 
 	q := new(dns.Msg)
 	q.SetQuestion("example.com.", dns.TypeA)
@@ -100,7 +100,7 @@ func TestPipelineQuestionMatch(t *testing.T) {
 	df := func(address string) (*dns.Conn, error) {
 		return &dns.Conn{Conn: client}, nil
 	}
-	p := NewPipeline("test", "localhost:53", testDialer(df), time.Second)
+	p := NewPipeline("test", "localhost:53", testDialer(df), time.Second, false)
 
 	q := new(dns.Msg)
 	q.SetQuestion("example.com.", dns.TypeA)
@@ -136,7 +136,7 @@ func TestPipelineRejectEmptyQuestion(t *testing.T) {
 	df := func(address string) (*dns.Conn, error) {
 		return &dns.Conn{Conn: client}, nil
 	}
-	p := NewPipeline("test", "localhost:53", testDialer(df), time.Second)
+	p := NewPipeline("test", "localhost:53", testDialer(df), time.Second, false)
 
 	q := new(dns.Msg)
 	q.SetQuestion("example.com.", dns.TypeA)
