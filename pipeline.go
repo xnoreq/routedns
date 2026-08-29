@@ -17,6 +17,8 @@ const defaultQueryTimeout = 2 * time.Second
 // Tear down an upstream connection if nothing has been received for this long.
 const idleTimeout = 10 * time.Second
 
+const emaAlpha float32 = 0.5
+
 // Pipeline is a DNS client that is able to use pipelining for multiple requests over
 // one connection, handle out-of-order responses and deals with disconnects
 // gracefully. It opens a single connection on demand and uses it for all queries.
@@ -116,6 +118,7 @@ func (p *Pipeline) start() {
 		done := make(chan struct{})
 		// Lazy connection. Only open a real connection if there's a request
 		log.Debug("opening connection")
+		dialTime := time.Now()
 		conn, err := p.client.Dial(p.addr)
 		if err != nil {
 			p.metrics.err.Add("open", 1)
@@ -123,6 +126,8 @@ func (p *Pipeline) start() {
 			req.markDone(nil, err)
 			continue
 		}
+		dialDuration := time.Since(dialTime)
+		avgLatencyUs := float32(dialDuration.Microseconds())
 
 		wg.Add(2)
 
@@ -226,17 +231,19 @@ func (p *Pipeline) start() {
 				p.metrics.response.Add(rCode(a), 1)
 				req.markDone(a, nil)
 
+				avgLatencyUs = (float32(req.timeUs) * emaAlpha) + (avgLatencyUs * (1 - emaAlpha))
+
 				ql := p.inFlight.maxQueueLen()
 				if ql > p.metrics.maxQueueLen.Value() {
 					p.metrics.maxQueueLen.Set(ql)
 				}
 
 				if timeout, ok := popKeepalive(a, req.hadEdns0); ok {
-					if timeout == 0 { // Server requests immediate close
+					if timeout == 0 { // Server requests close asap
 						return
 					}
 
-					nextIdleTimeout = timeout
+					nextIdleTimeout = timeout - 2*time.Duration(avgLatencyUs)*time.Microsecond
 				}
 			}
 		}()
@@ -322,6 +329,7 @@ func popKeepalive(resp *dns.Msg, originalHadEdns0 bool) (time.Duration, bool) {
 // closed when the request is done.
 type request struct {
 	q, a     *dns.Msg
+	timeUs   int64
 	id       uint16
 	hadEdns0 bool
 	err      error
@@ -381,6 +389,7 @@ func (q *inFlightQueue) add(r *request, query *dns.Msg) *dns.Msg {
 		id++
 	}
 	r.id = id
+	r.timeUs = time.Now().UnixMicro()
 	q.requests[id] = r
 
 	query.Id = id
@@ -403,6 +412,7 @@ func (q *inFlightQueue) get(a *dns.Msg) *request {
 	if err := validateResponseQuestion(r.q, a); err != nil {
 		return nil
 	}
+	r.timeUs = time.Now().UnixMicro() - r.timeUs
 	delete(q.requests, id)
 	return r
 }
