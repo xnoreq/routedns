@@ -121,20 +121,6 @@ func (p *Pipeline) start() {
 			p.metrics.err.Add("open", 1)
 			log.Warn("failed to open connection", "error", err)
 			req.markDone(nil, err)
-
-			// drain and fail queued requests
-		DrainLoop:
-			for {
-				select {
-				case req, ok = <-p.requests:
-					if !ok {
-						break DrainLoop
-					}
-					req.markDone(nil, err)
-				default:
-					break DrainLoop
-				}
-			}
 			continue
 		}
 
